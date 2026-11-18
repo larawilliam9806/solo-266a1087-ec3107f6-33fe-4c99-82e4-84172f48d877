@@ -120,12 +120,16 @@ def create_app(data_dir: str | None = None, downstream_dir: str | None = None) -
                     f"但当前版本已变为 v{current_version}（另一页面已成功发布）"
                 )
             else:
-                reason_map = {
-                    "published": "该修订已经发布，不能重复发布",
-                    "obsolete": "该预览已被更新的发布超越而作废",
-                    "cancelled": "该修订已被放弃（取消）",
-                }
-                stale_reason = reason_map.get(session["status"], "该修订会话已失效")
+                # 优先展示作废时记录的具体原因（如升级前遗留预览须重新上传）
+                if session.get("obsolete_reason"):
+                    stale_reason = session["obsolete_reason"]
+                else:
+                    reason_map = {
+                        "published": "该修订已经发布，不能重复发布",
+                        "obsolete": "该预览已被更新的发布超越而作废",
+                        "cancelled": "该修订已被放弃（取消）",
+                    }
+                    stale_reason = reason_map.get(session["status"], "该修订会话已失效")
             diff = storage.preview_diff(session["rows"])
             storage.log(
                 "conflict",

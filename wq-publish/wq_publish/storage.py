@@ -17,14 +17,42 @@ import os
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 
 from .validation import format_concentration, render_csv
 
 LIVE_FILENAME = "published_results.csv"
 
+# 升级前未确认预览会话的统一作废原因（这些会话的浓度已经过 float 舍入，
+# 丢失的原始精度无法从已保存数值推测，必须重新上传）
+LEGACY_SESSION_REASON = "该预览创建于浓度精度升级之前，浓度可能已被浮点舍入，请重新上传 CSV 后再发布"
+STALE_SESSION_REASON = "预览会话超过 24 小时未确认，已自动作废"
+
 
 class PublishConflictError(Exception):
     """确认发布时基线版本已过期，需要重新预览。"""
+
+
+def _as_decimal(value) -> Decimal:
+    """把浓度（十进制文本/Decimal/历史 float）转为 Decimal 再比较。
+
+    历史 float 先经 ``str`` 再转 Decimal，按“已保存数值”的最短往返表示
+    比较，不推测任何已丢失的原始精度。
+    """
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, float):
+        return Decimal(str(value))
+    return Decimal(value)
+
+
+def _is_publishable_concentration(text: str) -> bool:
+    """发布前兜底校验：浓度必须是有限、非负的十进制文本。"""
+    try:
+        value = Decimal(text)
+    except (InvalidOperation, ValueError):
+        return False
+    return value.is_finite() and value >= 0
 
 
 def _now() -> str:
@@ -71,7 +99,7 @@ class Storage:
                     batch_no TEXT NOT NULL,
                     sample_no TEXT NOT NULL,
                     analyte TEXT NOT NULL,
-                    concentration REAL NOT NULL CHECK (concentration >= 0),
+                    concentration TEXT NOT NULL,
                     UNIQUE (version, sample_no, analyte)
                 );
                 CREATE INDEX IF NOT EXISTS idx_results_version
@@ -82,7 +110,8 @@ class Storage:
                     base_version INTEGER NOT NULL,
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK (status IN ('pending','published','obsolete','cancelled'))
+                    status TEXT NOT NULL CHECK (status IN ('pending','published','obsolete','cancelled')),
+                    obsolete_reason TEXT
                 );
                 CREATE TABLE IF NOT EXISTS event_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -92,6 +121,88 @@ class Storage:
                 );
                 """
             )
+            self._migrate_legacy_schema(conn)
+
+    def _migrate_legacy_schema(self, conn: sqlite3.Connection) -> None:
+        """升级旧库：REAL 浓度列迁移为保留完整精度的 TEXT，并作废遗留预览。
+
+        既有版本只按数据库中**已保存的数值**供数（旧值原本就是 float，
+        按最短往返文本 repr 写出，与升级前发布的 CSV 逐字符一致），
+        不推测任何在上传时已丢失的原始精度。
+        升级前创建、尚未确认的预览会话，其载荷里的浓度是舍入后的 float，
+        一律作废并提示重新上传，不得按舍入值发布。
+        """
+        legacy = conn.execute(
+            "SELECT 1 FROM pragma_table_info('results') WHERE name='concentration' "
+            "AND lower(type) LIKE '%real%'"
+        ).fetchone()
+        upgraded_from_legacy = legacy is not None
+        if upgraded_from_legacy:
+            old_rows = conn.execute(
+                "SELECT id, version, batch_no, sample_no, analyte, concentration "
+                "FROM results ORDER BY id"
+            ).fetchall()
+            conn.execute("ALTER TABLE results RENAME TO results_legacy")
+            conn.execute(
+                """
+                CREATE TABLE results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    version INTEGER NOT NULL,
+                    batch_no TEXT NOT NULL,
+                    sample_no TEXT NOT NULL,
+                    analyte TEXT NOT NULL,
+                    concentration TEXT NOT NULL,
+                    UNIQUE (version, sample_no, analyte)
+                )
+                """
+            )
+            conn.executemany(
+                "INSERT INTO results(id, version, batch_no, sample_no, analyte,"
+                " concentration) VALUES (?,?,?,?,?,?)",
+                [
+                    (r["id"], r["version"], r["batch_no"], r["sample_no"],
+                     r["analyte"], repr(float(r["concentration"])))
+                    for r in old_rows
+                ],
+            )
+            conn.execute("DROP TABLE results_legacy")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_results_version ON results(version)"
+            )
+            self._log(
+                conn, "migrate",
+                f"浓度存储由 REAL 迁移为精确十进制文本（{len(old_rows)} 行既有版本"
+                "按已保存数值保留，不推测丢失的原始精度）",
+            )
+
+        # 旧版 revision_sessions 没有 obsolete_reason 列，补上以便区分作废原因
+        cols = {r["name"] for r in conn.execute(
+            "SELECT name FROM pragma_table_info('revision_sessions')"
+        ).fetchall()}
+        if "obsolete_reason" not in cols:
+            conn.execute(
+                "ALTER TABLE revision_sessions ADD COLUMN obsolete_reason TEXT"
+            )
+
+        # 仅在真正从旧版（REAL 浮点）升级时才作废未确认预览：这些会话的载荷是
+        # 舍入后的 float，不能按舍入值发布。新建库/常规重启的会话浓度是精确文本，
+        # 绝不能误伤（它们另由 24 小时过期与发布时兜底校验保护）。
+        if upgraded_from_legacy:
+            pending = conn.execute(
+                "SELECT token FROM revision_sessions WHERE status='pending'"
+            ).fetchall()
+            if pending:
+                conn.executemany(
+                    "UPDATE revision_sessions SET status='obsolete', "
+                    "obsolete_reason=? WHERE token=? AND status='pending'",
+                    [(LEGACY_SESSION_REASON, s["token"]) for s in pending],
+                )
+                for s in pending:
+                    self._log(
+                        conn, "migrate",
+                        f"升级前未确认的预览会话 {s['token'][:8]} 已作废："
+                        "载荷浓度为舍入值，需重新上传",
+                    )
 
     def _log(self, conn: sqlite3.Connection, kind: str, detail: str) -> None:
         conn.execute(
@@ -176,8 +287,9 @@ class Storage:
             ).fetchall()
             for s in stale:
                 conn.execute(
-                    "UPDATE revision_sessions SET status='obsolete' WHERE token=?",
-                    (s["token"],),
+                    "UPDATE revision_sessions SET status='obsolete', "
+                    "obsolete_reason=? WHERE token=?",
+                    (STALE_SESSION_REASON, s["token"]),
                 )
                 self._log(
                     conn, "recover",
@@ -279,13 +391,15 @@ class Storage:
             )
         return token
 
-    def mark_obsolete(self, token: str, current_version: int) -> None:
+    def mark_obsolete(self, token: str, current_version: int,
+                      reason: str | None = None) -> None:
         """预览在确认前已被其他发布超越：作废该会话，强制重新预览。"""
         with self._connect() as conn:
             cur = conn.execute(
-                "UPDATE revision_sessions SET status='obsolete' "
+                "UPDATE revision_sessions SET status='obsolete', "
+                "obsolete_reason=COALESCE(?, obsolete_reason) "
                 "WHERE token=? AND status='pending'",
-                (token,),
+                (reason, token),
             )
             if cur.rowcount:
                 self._log(
@@ -308,7 +422,12 @@ class Storage:
 
     # ---------- 预览差异 ----------
     def preview_diff(self, new_rows: list[dict]) -> dict:
-        """与当前已发布版本比对，返回 增/改/删/不变 四类差异。"""
+        """与当前已发布版本比对，返回 增/改/删/不变 四类差异。
+
+        浓度按 Decimal 精确比较：只要十进制数值不同即判为「修改」，
+        不受浮点精度影响（例如 0.10000000000000001 与 0.1 视为不同读数）。
+        展示值仍保留各自的原始文本。
+        """
         old = {(r["sample_no"], r["analyte"]): r["concentration"]
                for r in self.current_rows()}
         new = {(r["sample_no"], r["analyte"]): r["concentration"] for r in new_rows}
@@ -316,7 +435,7 @@ class Storage:
         for key, val in new.items():
             if key not in old:
                 inserts.append({"sample_no": key[0], "analyte": key[1], "new": val})
-            elif old[key] != val:
+            elif _as_decimal(old[key]) != _as_decimal(val):
                 updates.append(
                     {"sample_no": key[0], "analyte": key[1],
                      "old": old[key], "new": val}
@@ -373,6 +492,24 @@ class Storage:
                 )
 
             rows = json.loads(session["payload"])
+            # 防御：只有以精确十进制文本承载的新会话才允许发布。
+            # 遗留会话（浓度为 float 或无法按有限非负十进制解析）已在迁移时
+            # 作废；此处再兜底拒绝，绝不按舍入值发布。
+            if not all(
+                isinstance(r.get("concentration"), str)
+                and _is_publishable_concentration(r["concentration"])
+                for r in rows
+            ):
+                conn.execute(
+                    "UPDATE revision_sessions SET status='obsolete', "
+                    "obsolete_reason=? WHERE token=?",
+                    (LEGACY_SESSION_REASON, token),
+                )
+                self._log(
+                    conn, "conflict",
+                    f"会话 {token[:8]} 载荷缺少精确十进制浓度，拒绝发布，需重新上传",
+                )
+                raise PublishConflictError(LEGACY_SESSION_REASON)
             new_version = current_version + 1
             csv_text = render_csv(rows)
             content_hash = hashlib.sha256(csv_text.encode("utf-8")).hexdigest()
@@ -411,5 +548,6 @@ class Storage:
 
     # ---------- 页面辅助 ----------
     @staticmethod
-    def display_concentration(value: float) -> str:
+    def display_concentration(value) -> str:
+        """浓度展示文本：精确数据原样返回，历史浮点按最短往返表示呈现。"""
         return format_concentration(value)

@@ -6,18 +6,22 @@
 3. 并发：两个页面从同一版本发起，仅一个发布成功，另一个 409 须重新预览
 4. 崩溃恢复：文件缺失、文件被改坏、遗留临时文件、游离文件、改名后未提交
 5. 撤回语义：整批替换后旧行消失；会话取消/重复发布防护
+6. 十进制精度：大整数/长尾小数全链路无损，数值不同的修订必显示变化
+7. 旧版 REAL 库迁移：既有版本按已保存数值供数，遗留未确认预览作废并要求重传
 """
 import hashlib
 import io
+import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from wq_publish.app import create_app
-from wq_publish.storage import LIVE_FILENAME
+from wq_publish.storage import LIVE_FILENAME, PublishConflictError
 from wq_publish.validation import render_csv, validate_csv
 
 PASS, FAIL = 0, 0
@@ -74,7 +78,29 @@ for text in ["S1,氨氮,nan", "S1,氨氮,inf", "S1,氨氮,abc"]:
 
 raw_zero = "样本号,检测项目,浓度\nS1,氨氮,0\n".encode()
 rows, errs = validate_csv(raw_zero, "B1")
-check("零浓度（非负边界）通过", errs == [] and rows[0]["concentration"] == 0.0, str(errs))
+check("零浓度（非负边界）通过", errs == [] and rows[0]["concentration"] == "0", str(errs))
+
+# 1b 十进制精度：解析结果必须原样保留上传文本，不做 float 舍入
+raw_precision = (
+    "样本号,检测项目,浓度\n"
+    "P1,氨氮,9007199254740993\n"
+    "P2,COD,0.10000000000000001\n"
+    "P3,总磷,123456789012345678901234567890\n"
+    "P4,铅,0.00000000000000000001\n"
+).encode()
+rows, errs = validate_csv(raw_precision, "B1")
+check("高精度 CSV 通过校验", errs == [] and len(rows) == 4, str(errs))
+got = {r["sample_no"]: r["concentration"] for r in (rows or [])}
+check("大整数 9007199254740993 不被舍入为 9007199254740992",
+      got.get("P1") == "9007199254740993", str(got))
+check("长尾小数 0.10000000000000001 不被折叠为 0.1",
+      got.get("P2") == "0.10000000000000001", str(got))
+check("超大整数与超小小数逐字符保留",
+      got.get("P3") == "123456789012345678901234567890"
+      and got.get("P4") == "0.00000000000000000001", str(got))
+check("规范渲染 CSV 浓度列与上传文本一致",
+      "9007199254740993" in render_csv(rows)
+      and "0.10000000000000001" in render_csv(rows))
 
 # ---------------- 2-5. 端到端（隔离临时目录） ----------------
 tmp = tempfile.mkdtemp(prefix="wq-selftest-")
@@ -124,9 +150,9 @@ check("发布后登记为 v2、5 行", reg["current_version"] == 2 and reg["row_
 current = app.storage.current_rows()
 check("撤回生效：S002 氨氮已不存在",
       not any(r["sample_no"] == "S002" and r["analyte"] == "氨氮" for r in current))
-check("修改生效：S001 氨氮=1.3",
+check("修改生效：S001 氨氮=1.30（保留上传文本 1.30）",
       any(r["sample_no"] == "S001" and r["analyte"] == "氨氮"
-          and r["concentration"] == 1.3 for r in current))
+          and r["concentration"] == "1.30" for r in current))
 file_hash = hashlib.sha256(open(live, "rb").read()).hexdigest()
 check("v2 文件哈希与登记一致", file_hash == reg["content_hash"])
 
@@ -207,6 +233,230 @@ check("取消后发布被拒绝（409 且会话 cancelled）",
       and app.storage.get_session(tok)["status"] == "cancelled")
 check("取消不影响当前版本",
       app.storage.current_registry()["current_version"] == v_before)
+
+# ---------------- 7. 十进制精度全链路 ----------------
+print("== 7. 浓度精度：上传/预览/版本存储/发布文件/启动恢复 全链路无损 ==")
+ptmp = tempfile.mkdtemp(prefix="wq-precision-")
+pdata, pdown = os.path.join(ptmp, "data"), os.path.join(ptmp, "downstream")
+papp = create_app(data_dir=pdata, downstream_dir=pdown)
+pclient = papp.test_client()
+
+precision_csv = (
+    "样本号,检测项目,浓度(mg/L)\n"
+    "P1,氨氮,9007199254740993\n"
+    "P2,COD,0.10000000000000001\n"
+).encode()
+resp = pclient.post(
+    "/preview",
+    data={"batch_no": "PRECISION-1",
+          "csv_file": (io.BytesIO(precision_csv), "precision.csv")},
+    content_type="multipart/form-data",
+)
+check("高精度文件预览成功", resp.status_code == 200)
+check("预览页原样显示 9007199254740993",
+      b"9007199254740993" in resp.data and b"9007199254740992" not in resp.data)
+check("预览页原样显示 0.10000000000000001",
+      b"0.10000000000000001" in resp.data)
+ptoken = re.search(rb'/publish/([0-9a-f]+)', resp.data).group(1).decode()
+pclient.post(f"/publish/{ptoken}")
+
+live_text = open(os.path.join(pdown, LIVE_FILENAME), "rb").read().decode()
+check("发布文件逐字符保留 9007199254740993",
+      "9007199254740993" in live_text and "9007199254740992" not in live_text)
+check("发布文件逐字符保留 0.10000000000000001",
+      "0.10000000000000001" in live_text)
+stored = papp.storage.current_rows()
+sval = {r["sample_no"]: r["concentration"] for r in stored}
+check("版本库以精确文本存储（非 float）",
+      sval.get("P1") == "9007199254740993"
+      and sval.get("P2") == "0.10000000000000001", str(sval))
+with papp.storage._connect() as conn:
+    col_type = conn.execute(
+        "SELECT type FROM pragma_table_info('results') WHERE name='concentration'"
+    ).fetchone()["type"]
+check("results.concentration 列为 TEXT", col_type.upper() == "TEXT", col_type)
+
+# 数值不同的修订必须判为“修改”，即便差异小到 float 无法区分
+revision_csv = (
+    "样本号,检测项目,浓度(mg/L)\n"
+    "P1,氨氮,9007199254740994\n"
+    "P2,COD,0.10000000000000002\n"
+).encode()
+resp = pclient.post(
+    "/preview",
+    data={"batch_no": "PRECISION-2",
+          "csv_file": (io.BytesIO(revision_csv), "revision.csv")},
+    content_type="multipart/form-data",
+)
+body = resp.data.decode()
+check("两个不同读数均判为修改（~2）", "~2" in body, body[:200])
+check("修改区同时呈现旧值 9007199254740993 与新值 9007199254740994",
+      "9007199254740993" in body and "9007199254740994" in body)
+check("修改区同时呈现旧值 0.10000000000000001 与新值 0.10000000000000002",
+      "0.10000000000000001" in body and "0.10000000000000002" in body)
+rtoken = re.search(rb'/publish/([0-9a-f]+)', resp.data).group(1).decode()
+pclient.post(f"/publish/{rtoken}")
+sval2 = {r["sample_no"]: r["concentration"] for r in papp.storage.current_rows()}
+check("修订发布后新读数精确入库",
+      sval2.get("P1") == "9007199254740994"
+      and sval2.get("P2") == "0.10000000000000002", str(sval2))
+
+# 等价写法（0.100 与 0.1 数值相等）应判为“不变”，不产生虚假修改
+equiv_csv = (
+    "样本号,检测项目,浓度(mg/L)\n"
+    "P1,氨氮,9007199254740994\n"
+    "P2,COD,0.10000000000000002\n"
+).encode()
+resp = pclient.post(
+    "/preview",
+    data={"batch_no": "PRECISION-3",
+          "csv_file": (io.BytesIO(equiv_csv), "equiv.csv")},
+    content_type="multipart/form-data",
+)
+body = resp.data.decode()
+check("数值未变（文本不同也）判为不变：~0 且不变项 2",
+      "~0" in body and "不变项 2" in body, body[:200])
+
+# 启动恢复：删除文件后按登记重建，精度不丢失
+os.unlink(os.path.join(pdown, LIVE_FILENAME))
+papp2 = create_app(data_dir=pdata, downstream_dir=pdown)
+rebuilt = open(os.path.join(pdown, LIVE_FILENAME), "rb").read().decode()
+reg = papp2.storage.current_registry()
+check("恢复重建的文件保留全部精度且哈希与登记一致",
+      "9007199254740994" in rebuilt and "0.10000000000000002" in rebuilt
+      and hashlib.sha256(rebuilt.encode()).hexdigest() == reg["content_hash"])
+
+# 常规重启不得误伤新建库中尚未确认的预览会话（仅旧版升级才作废遗留预览）
+rtmp = tempfile.mkdtemp(prefix="wq-restart-")
+rdata, rdown = os.path.join(rtmp, "data"), os.path.join(rtmp, "downstream")
+rapp = create_app(data_dir=rdata, downstream_dir=rdown)
+rresp = rapp.test_client().post(
+    "/preview",
+    data={"batch_no": "RESTART-1",
+          "csv_file": (io.BytesIO(precision_csv), "precision.csv")},
+    content_type="multipart/form-data",
+)
+rtok = re.search(rb'/publish/([0-9a-f]+)', rresp.data).group(1).decode()
+rapp_restart = create_app(data_dir=rdata, downstream_dir=rdown)
+check("重启后未确认预览仍为 pending（不被误作废）",
+      rapp_restart.storage.get_session(rtok)["status"] == "pending")
+shutil.rmtree(rtmp, ignore_errors=True)
+shutil.rmtree(ptmp, ignore_errors=True)
+
+# ---------------- 8. 旧版 REAL 数据库迁移 ----------------
+print("== 8. 旧版 REAL 库升级：按已保存数值供数，遗留预览作废并要求重传 ==")
+ltmp = tempfile.mkdtemp(prefix="wq-legacy-")
+ldata, ldown = os.path.join(ltmp, "data"), os.path.join(ltmp, "downstream")
+os.makedirs(ldata, exist_ok=True)
+os.makedirs(ldown, exist_ok=True)
+db_path = os.path.join(ldata, "wq_publish.db")
+old_csv = (
+    "sample_no,analyte,concentration\n"
+    "L1,氨氮,9007199254740992.0\n"
+    "L2,COD,0.1\n"
+)
+with open(os.path.join(ldown, LIVE_FILENAME), "w", encoding="utf-8", newline="") as fh:
+    fh.write(old_csv)
+old_hash = hashlib.sha256(old_csv.encode()).hexdigest()
+# 手工构造升级前的 REAL 结构（含一条未确认预览，载荷里是舍入后的 float）
+conn = sqlite3.connect(db_path)
+conn.executescript(
+    """
+    CREATE TABLE registry (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        current_version INTEGER NOT NULL, batch_no TEXT NOT NULL,
+        row_count INTEGER NOT NULL, published_at TEXT NOT NULL,
+        content_hash TEXT NOT NULL
+    );
+    CREATE TABLE results (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, version INTEGER NOT NULL,
+        batch_no TEXT NOT NULL, sample_no TEXT NOT NULL, analyte TEXT NOT NULL,
+        concentration REAL NOT NULL CHECK (concentration >= 0),
+        UNIQUE (version, sample_no, analyte)
+    );
+    CREATE TABLE revision_sessions (
+        token TEXT PRIMARY KEY, batch_no TEXT NOT NULL, base_version INTEGER NOT NULL,
+        payload TEXT NOT NULL, created_at TEXT NOT NULL, status TEXT NOT NULL
+        CHECK (status IN ('pending','published','obsolete','cancelled'))
+    );
+    CREATE TABLE event_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
+        kind TEXT NOT NULL, detail TEXT NOT NULL
+    );
+    """
+)
+conn.execute(
+    "INSERT INTO registry VALUES (1,1,'OLD-BATCH',2,'2026-01-01T00:00:00+00:00',?)",
+    (old_hash,),
+)
+conn.executemany(
+    "INSERT INTO results(version,batch_no,sample_no,analyte,concentration)"
+    " VALUES (1,'OLD-BATCH',?,?,?)",
+    [("L1", "氨氮", 9007199254740992.0), ("L2", "COD", 0.1)],
+)
+legacy_payload = json.dumps([
+    {"sample_no": "L1", "analyte": "氨氮", "concentration": 9007199254740992.0},
+    {"sample_no": "L2", "analyte": "COD", "concentration": 0.1},
+])
+conn.execute(
+    "INSERT INTO revision_sessions VALUES ('legacytoken','OLD-BATCH',1,?,"
+    "'2026-01-01T00:00:00+00:00','pending')",
+    (legacy_payload,),
+)
+conn.commit()
+conn.close()
+
+lapp = create_app(data_dir=ldata, downstream_dir=ldown)
+lclient = lapp.test_client()
+with lapp.storage._connect() as c2:
+    col_type = c2.execute(
+        "SELECT type FROM pragma_table_info('results') WHERE name='concentration'"
+    ).fetchone()["type"]
+check("迁移后浓度列变为 TEXT", col_type.upper() == "TEXT", col_type)
+rows = lapp.storage.current_rows()
+lval = {r["sample_no"]: r["concentration"] for r in rows}
+check("既有版本按已保存数值供数（不推测丢失精度）",
+      lval.get("L1") == "9007199254740992.0" and lval.get("L2") == "0.1", str(lval))
+rebuilt = open(os.path.join(ldown, LIVE_FILENAME), "rb").read().decode()
+check("旧下游 CSV 与已保存数值一致，无需改写（哈希仍匹配）",
+      rebuilt == old_csv and lapp.storage.current_registry()["content_hash"] == old_hash)
+sess = lapp.storage.get_session("legacytoken")
+check("升级前未确认预览已标记 obsolete", sess["status"] == "obsolete")
+check("作废原因提示重新上传", bool(sess.get("obsolete_reason")) and "重新上传" in sess["obsolete_reason"])
+resp = lclient.post("/publish/legacytoken")
+check("遗留预览发布被拒（409）且页面提示重新上传",
+      resp.status_code == 409 and "重新上传".encode() in resp.data)
+try:
+    lapp.storage.publish("legacytoken")
+    raised = False
+except PublishConflictError:
+    raised = True
+check("存储层直接发布遗留会话同样拒绝", raised)
+events = lapp.storage.recent_events(50)
+check("迁移动作写入事件日志", any(e["kind"] == "migrate" for e in events))
+
+# 重新上传精确读数后可正常发布，且相对旧值正确显示“修改”
+new_csv = (
+    "样本号,检测项目,浓度(mg/L)\n"
+    "L1,氨氮,9007199254740993\n"
+    "L2,COD,0.10000000000000001\n"
+).encode()
+resp = lclient.post(
+    "/preview",
+    data={"batch_no": "NEW-BATCH",
+          "csv_file": (io.BytesIO(new_csv), "new.csv")},
+    content_type="multipart/form-data",
+)
+body = resp.data.decode()
+check("重新上传后旧舍入值与精确读数判为修改（~2）", "~2" in body, body[:200])
+ntoken = re.search(rb'/publish/([0-9a-f]+)', resp.data).group(1).decode()
+resp = lclient.post(f"/publish/{ntoken}")
+check("重新上传的精确批次发布成功", resp.status_code == 302)
+lval2 = {r["sample_no"]: r["concentration"] for r in lapp.storage.current_rows()}
+check("新版本精确保存原始读数",
+      lval2.get("L1") == "9007199254740993"
+      and lval2.get("L2") == "0.10000000000000001", str(lval2))
+shutil.rmtree(ltmp, ignore_errors=True)
 
 shutil.rmtree(tmp, ignore_errors=True)
 print(f"\n结果：{PASS} 通过，{FAIL} 失败")

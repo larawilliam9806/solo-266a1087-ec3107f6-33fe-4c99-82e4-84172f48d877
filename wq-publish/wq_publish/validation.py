@@ -3,13 +3,21 @@
 校验规则：
 1. 必须包含样本号、检测项目、浓度三列（兼容中英文表头）；
 2. 同一样本同一检测项目不得重复；
-3. 浓度必须是数字且为非负数（拒绝 NaN/Inf）。
+3. 浓度必须是有限的非负十进制数（拒绝 NaN/Inf/负数/非数字）。
+
+精度约定（重要）
+----------------
+浓度一律保留上传时的**原始十进制文本**，全程不经过 IEEE-754 双精度浮点：
+``9007199254740993`` 不会被舍入成 ``9007199254740992.0``，
+``0.10000000000000001`` 也不会被折叠成 ``0.1``。
+数值解析与相等判断使用 :class:`decimal.Decimal`，因此数值不同的修订
+（即使差异远小于浮点精度）也能被正确识别为「修改」。
 """
 from __future__ import annotations
 
 import csv
 import io
-import math
+from decimal import Decimal, InvalidOperation
 
 CANONICAL_HEADER = ["sample_no", "analyte", "concentration"]
 
@@ -33,12 +41,39 @@ _HEADER_ALIASES = {
 
 _MAX_ERRORS = 50
 
+# 单个浓度文本的长度上限：十进制精度无损，但仍防止异常超长输入拖垮解析
+_MAX_CONC_TEXT_LEN = 255
+
+
+def parse_concentration(conc_text: str) -> Decimal:
+    """把浓度文本解析为 Decimal。
+
+    成功返回有限非负 Decimal；失败抛出 ValueError（消息面向数据员）。
+    调用方负责保证 conc_text 已 strip 且非空。
+    """
+    if len(conc_text) > _MAX_CONC_TEXT_LEN:
+        raise ValueError(
+            f"浓度文本超过 {_MAX_CONC_TEXT_LEN} 个字符，请核对仪器导出格式"
+        )
+    try:
+        value = Decimal(conc_text)
+    except (InvalidOperation, ValueError):
+        raise ValueError(f"浓度“{conc_text}”不是合法数字")
+    if not value.is_finite():
+        raise ValueError("浓度不能为 NaN 或无穷大")
+    if value < 0:
+        raise ValueError(f"浓度 {conc_text} 为负数，必须 ≥ 0")
+    return value
+
 
 def validate_csv(raw_bytes: bytes, batch_no: str):
     """校验上传内容。
 
     返回 (rows, errors)：成功时 rows 为 dict 列表、errors 为空列表；
     失败时 rows 为 None、errors 为面向数据员的中文错误信息（含行号）。
+
+    成功行的 ``concentration`` 字段是**未经舍入的原始十进制文本**，
+    后续预览、会话存储、版本入库与发布 CSV 均原样保留该文本。
     """
     errors: list[str] = []
     batch_no = (batch_no or "").strip()
@@ -104,20 +139,12 @@ def validate_csv(raw_bytes: bytes, batch_no: str):
             errors.append(f"第 {line_no} 行：浓度为空")
             row_ok = False
 
-        value = None
         if conc_text:
             try:
-                value = float(conc_text)
-            except ValueError:
-                errors.append(f"第 {line_no} 行：浓度“{conc_text}”不是合法数字")
+                parse_concentration(conc_text)
+            except ValueError as exc:
+                errors.append(f"第 {line_no} 行：{exc}")
                 row_ok = False
-            else:
-                if math.isnan(value) or math.isinf(value):
-                    errors.append(f"第 {line_no} 行：浓度不能为 NaN 或无穷大")
-                    row_ok = False
-                elif value < 0:
-                    errors.append(f"第 {line_no} 行：浓度 {value} 为负数，必须 ≥ 0")
-                    row_ok = False
 
         key = (sample_no, analyte)
         if sample_no and analyte:
@@ -131,8 +158,10 @@ def validate_csv(raw_bytes: bytes, batch_no: str):
                 seen[key] = line_no
 
         if row_ok:
+            # 保留原始十进制文本：不做 float 转换，避免大整数/长尾小数精度丢失
             rows.append(
-                {"sample_no": sample_no, "analyte": analyte, "concentration": value}
+                {"sample_no": sample_no, "analyte": analyte,
+                 "concentration": conc_text}
             )
         if len(errors) >= _MAX_ERRORS:
             errors.append(f"错误过多，仅展示前 {_MAX_ERRORS} 条，请修正后重新上传")
@@ -145,13 +174,24 @@ def validate_csv(raw_bytes: bytes, batch_no: str):
     return rows, []
 
 
-def format_concentration(value: float) -> str:
-    """规范浓度文本：float 的最短往返表示，保证重新解析结果一致。"""
+def format_concentration(value) -> str:
+    """规范浓度文本。
+
+    新数据的浓度始终是校验阶段保留的原始十进制文本，原样返回即可
+    （重新 Decimal 解析必然得到同一数值，无任何舍入）。
+    兼容历史浮点数据（如升级前遗留会话的 JSON 载荷）：按旧版
+    ``repr(float)`` 规则呈现，不补推任何已丢失的精度。
+    """
+    if isinstance(value, str):
+        return value
     return repr(float(value))
 
 
 def render_csv(rows: list[dict]) -> str:
-    """把校验通过的行渲染为规范 CSV（按样本号、项目排序，输出稳定）。"""
+    """把校验通过的行渲染为规范 CSV（按样本号、项目排序，输出稳定）。
+
+    浓度列直接写原始十进制文本，保证发布文件与上传读数逐字符一致。
+    """
     buf = io.StringIO()
     writer = csv.writer(buf, lineterminator="\n")
     writer.writerow(CANONICAL_HEADER)

@@ -1,0 +1,24 @@
+# docker compose up -d --build 启动；数据与下游文件持久化在本目录下的卷中。
+services:
+  wq-publish:
+    build: .
+    image: wq-publish:latest
+    container_name: wq-publish
+    ports:
+      - "5000:5000"
+    environment:
+      # 与容器内路径对应；如需改宿主机目录，调整下方 volumes 即可
+      WQ_DATA_DIR: /data
+      WQ_DOWNSTREAM_DIR: /downstream
+    volumes:
+      # SQLite 登记、flask 密钥、quarantine 隔离区
+      - ./data:/data
+      # 下游采集程序读取的 published_results.csv
+      - ./downstream:/downstream
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-I", "healthcheck.py"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
